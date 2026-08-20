@@ -1,0 +1,524 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+
+
+```{r}
+library(tidyverse)
+library(terra)
+library(tidyterra)
+library(firebehavioR)
+library(ggtext)
+library(cowplot)
+library(lme4)
+library(dplyr)
+library(broom)
+
+options(scipen = 999)
+options(timeout = 10000)
+```
+
+
+```{r Complexity Dataset}
+Height_var <- Campaign23 %>% # From CaBH_Summary
+  group_by(Plot, ForTyp) %>%
+  summarize(
+    SD_height = sd(Tree_Height, na.rm = TRUE),
+    mean_height = mean(Tree_Height, na.rm = TRUE),
+    Stand_complexity_CV = SD_height / mean_height,
+    .groups = "drop")
+
+var_across_plots <- CaBH_Comparison_long %>% # From CaBH_Summary
+  group_by(Plot) %>%
+  summarise(
+    SD_CBH = sd(CBH, na.rm = TRUE),
+    mean_CBH = mean(CBH, na.rm = TRUE),
+    CV_CBH = SD_CBH / mean_CBH,
+    .groups = "drop")
+
+CBH_complexity <- left_join(var_across_plots, Height_var, by = "Plot")
+```
+
+
+```{r}
+lm_results <- CBH_complexity %>%
+  group_by(ForTyp) %>%
+  group_modify(~{
+    model <- lm(SD_CBH ~ SD_height, data = .x)
+    tidy_mod <- tidy(model)
+    glance_mod <- glance(model)
+    tibble(
+      intercept = tidy_mod$estimate[tidy_mod$term == "(Intercept)"],
+      slope     = tidy_mod$estimate[tidy_mod$term == "SD_height"],
+      r2        = glance_mod$r.squared,
+      p         = round(glance_mod$p.value, digits = 4)
+    )
+  }) %>%
+  ungroup() %>%
+  arrange(ForTyp) %>%
+  mutate(
+   label = sprintf("%s: y = %.2f + %.2fx,   R² = %.2f,   p = %.2f", ForTyp, intercept, slope, r2, p)
+  )
+
+
+cols <- c(
+  "pinyon-juniper" = "#009E73",
+  "ponderosa pine" = "#0072B2",
+  "mixed conifer"  = "#D55E00",
+  "spruce-fir"     = "#CC79A7"
+)
+
+CBH_complexity$Variable <- rep("Canopy base height")
+CaBH_TH_plot <- ggplot(
+  CBH_complexity, 
+  aes(x = SD_height, y = SD_CBH, color = ForTyp, fill = ForTyp)) +
+  geom_point(size = 1, alpha = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1, alpha = 0.2) +
+  scale_color_manual(values = cols) +
+  scale_fill_manual(values = cols) +
+  scale_y_continuous(breaks = seq(0, 5, by = 1)) +
+  theme_bw(base_size = 9) +
+  coord_cartesian(ylim = c(0,4.6), xlim = c(0,12.5))+
+  labs(
+    x = "Within-plot standard deviation in tree height (m)",
+    y = "Among-method standard deviation in CaBH (m)",
+    color = "Forest Type",
+    fill = "Forest Type"
+  ) +
+  theme(
+    axis.text=element_text(size=8),
+    axis.title=element_text(size=8),
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  )
+
+y_positions <- c(
+  "pinyon-juniper" = -0.1,
+  "ponderosa pine" = 0.1,
+  "mixed conifer"  = 0.30,
+  "spruce-fir"     = 0.5
+)
+
+x_annot <- max(CBH_complexity$Stand_complexity_CV, na.rm = TRUE)
+
+for (i in seq_len(nrow(lm_results))) {
+  ft <- as.character(lm_results$ForTyp[i])
+  CaBH_TH_plot <- CBH_plot + annotate(
+    "text",
+    x = 12.5,
+    y = y_positions[ft],
+    label = lm_results$label[i],
+    hjust = 1,
+    size = 2.75,
+    color = cols[ft]
+  )
+}
+
+CaBH_TH_plot
+```
+
+
+```{r}
+cols <- c(
+  "pinyon-juniper" = "#009E73",
+  "ponderosa pine" = "#0072B2",
+  "mixed conifer"  = "#D55E00",
+  "spruce-fir"     = "#CC79A7"
+)
+
+# Low load compact conifer litter
+TI_var_across_plots <- TI_TL1 %>%
+  group_by(Plot) %>%
+  summarise(
+    SD_TI_kmh = sd(TI_kmh, na.rm = TRUE),
+    mean_TI_kmh = mean(TI_kmh, na.rm = TRUE),
+    CV_TI_kmh = SD_TI_kmh / mean_TI_kmh,
+    .groups = "drop"
+  )
+
+TI_complexity <- left_join(TI_var_across_plots, Height_var, by = "Plot")
+
+lm_results <- TI_complexity %>%
+  group_by(ForTyp) %>%
+  group_modify(~{
+    model <- lm(SD_TI_kmh ~ SD_height, data = .x)
+    tidy_mod <- tidy(model)
+    glance_mod <- glance(model)
+    tibble(
+      intercept = tidy_mod$estimate[tidy_mod$term == "(Intercept)"],
+      slope     = tidy_mod$estimate[tidy_mod$term == "SD_height"],
+      r2        = glance_mod$r.squared,
+      p         = round(glance_mod$p.value, digits = 4)
+    )
+  }) %>%
+  ungroup() %>%
+  arrange(ForTyp) %>%
+  mutate(
+   label = sprintf("%s: y = %.2f + %.2fx,   R² = %.2f,   p = %.2f", ForTyp, intercept, slope, r2, p)
+  )
+
+TI_complexity_plot_TL1 <- ggplot(TI_complexity, aes(x = SD_height, y = SD_TI_kmh, color = ForTyp, fill = ForTyp)) +
+  geom_point(size = 1, alpha = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1, alpha = 0.2) +
+  scale_y_continuous(breaks = seq(0, 200, by = 50)) +
+  coord_cartesian(ylim = c(-10,170), xlim = c(0,12.5))+
+  scale_color_manual(values = cols) +
+  scale_fill_manual(values = cols) +
+  theme_bw(base_size = 9) +
+  labs(
+    x = "Within-plot standard deviation in tree height (m)",
+    y = "Among-method standard deviation in torching index (km h⁻¹)",
+    color = "Forest Type",
+    fill = "Forest Type"
+  ) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank())
+
+y_positions <- c(
+  "pinyon-juniper" = -15,
+  "ponderosa pine" = -10,
+  "mixed conifer"  = -5,
+  "spruce-fir"     = 0
+)
+
+x_annot <- max(CBH_complexity$Stand_complexity_CV, na.rm = TRUE)
+
+for (i in seq_len(nrow(lm_results))) {
+  ft <- as.character(lm_results$ForTyp[i])
+  TI_complexity_plot_TL1 <- TI_complexity_plot_TL1 + annotate(
+    "text",
+    x = 12.5,
+    y = y_positions[ft],
+    label = lm_results$label[i],
+    hjust = 1,
+    size = 3,
+    color = cols[ft]
+  )
+}
+
+TI_complexity_plot_TL1 <- TI_complexity_plot_TL1 + annotate("text",
+    x = -0.15,
+    y = 150,
+    label = "Fuel model TL1: \nLow load compact conifer litter",
+    hjust = 0,
+    size = 5,
+    color = "black"
+  )
+
+TI_complexity_plot_TL1 <- TI_complexity_plot_TL1 + annotate("text",
+    x = -0.15,
+    y = 170,
+    label = "A)",
+    hjust = 0,
+    size = 7,
+    color = "black"
+  )
+
+TI_complexity_plot_TL1
+
+
+# Moderate load fuel model
+TI_var_across_plots <- TI_GS2 %>%
+  group_by(Plot) %>%
+  summarise(
+    SD_TI_kmh = sd(TI_kmh, na.rm = TRUE),
+    mean_TI_kmh = mean(TI_kmh, na.rm = TRUE),
+    CV_TI_kmh = SD_TI_kmh / mean_TI_kmh,
+    .groups = "drop"
+  )
+
+TI_complexity <- left_join(TI_var_across_plots, Height_var, by = "Plot")
+
+lm_results <- TI_complexity %>%
+  group_by(ForTyp) %>%
+  group_modify(~{
+    model <- lm(SD_TI_kmh ~ SD_height, data = .x)
+    tidy_mod <- tidy(model)
+    glance_mod <- glance(model)
+    tibble(
+      intercept = tidy_mod$estimate[tidy_mod$term == "(Intercept)"],
+      slope     = tidy_mod$estimate[tidy_mod$term == "SD_height"],
+      r2        = glance_mod$r.squared,
+      p         = round(glance_mod$p.value, digits = 4)
+    )
+  }) %>%
+  ungroup() %>%
+  arrange(ForTyp) %>%
+  mutate(
+   label = sprintf("%s: y = %.2f + %.2fx,   R² = %.2f,   p = %.2f", ForTyp, intercept, slope, r2, p)
+  )
+
+TI_complexity_plot_GS2 <- ggplot(TI_complexity, aes(x = SD_height, y = SD_TI_kmh, color = ForTyp, fill = ForTyp)) +
+  geom_point(size = 1, alpha = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1, alpha = 0.2) +
+  scale_y_continuous(breaks = seq(0, 5, by = 1)) +
+  coord_cartesian(ylim = c(-0.15,4.5), xlim = c(0,12.5))+
+  scale_color_manual(values = cols) +
+  scale_fill_manual(values = cols) +
+  theme_bw(base_size = 9) +
+  labs(
+    x = "Within-plot standard deviation in tree height (m)",
+    y = "Among-method standard deviation in torching index (km h⁻¹)",
+    color = "Forest Type",
+    fill = "Forest Type"
+  ) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank())
+
+y_positions <- c(
+  "pinyon-juniper" = -0.26,
+  "ponderosa pine" = -0.13,
+  "mixed conifer"  =  0,
+  "spruce-fir"     =  0.13
+)
+
+x_annot <- max(CBH_complexity$Stand_complexity_CV, na.rm = TRUE)
+
+for (i in seq_len(nrow(lm_results))) {
+  ft <- as.character(lm_results$ForTyp[i])
+  TI_complexity_plot_GS2 <- TI_complexity_plot_GS2 + annotate(
+    "text",
+    x = 12.5,
+    y = y_positions[ft],
+    label = lm_results$label[i],
+    hjust = 1,
+    size = 3,
+    color = cols[ft]
+  )
+}
+
+TI_complexity_plot_GS2 <- TI_complexity_plot_GS2 + annotate("text",
+    x = -0.15,
+    y = 3.97,
+    label = "Fuel model GS2: \nModerate load dry climate grass-shrub",
+    hjust = 0,
+    size = 5,
+    color = "black"
+  )
+
+TI_complexity_plot_GS2 <- TI_complexity_plot_GS2 + annotate("text",
+    x = -0.15,
+    y = 4.5,
+    label = "B)",
+    hjust = 0,
+    size = 7,
+    color = "black"
+  )
+
+TI_complexity_plot_GS2
+
+# High load fuel model
+TI_var_across_plots <- TI_SB3 %>%
+  group_by(Plot) %>%
+  summarise(
+    SD_TI_kmh = sd(TI_kmh, na.rm = TRUE),
+    mean_TI_kmh = mean(TI_kmh, na.rm = TRUE),
+    CV_TI_kmh = SD_TI_kmh / mean_TI_kmh,
+    .groups = "drop"
+  )
+
+TI_complexity <- left_join(TI_var_across_plots, Height_var, by = "Plot") 
+
+lm_results <- TI_complexity %>%
+  group_by(ForTyp) %>%
+  group_modify(~{
+    model <- lm(SD_TI_kmh ~ SD_height, data = .x)
+    tidy_mod <- tidy(model)
+    glance_mod <- glance(model)
+    tibble(
+      intercept = tidy_mod$estimate[tidy_mod$term == "(Intercept)"],
+      slope     = tidy_mod$estimate[tidy_mod$term == "SD_height"],
+      r2        = glance_mod$r.squared,
+      p         = round(glance_mod$p.value, digits = 4)
+    )
+  }) %>%
+  ungroup() %>%
+  arrange(ForTyp) %>%
+  mutate(
+   label = sprintf("%s: y = %.2f + %.2fx,   R² = %.2f,   p = %.2f", ForTyp, intercept, slope, r2, p)
+  )
+
+TI_complexity_plot_SB3 <- ggplot(TI_complexity, aes(x = SD_height, y = SD_TI_kmh, color = ForTyp, fill = ForTyp)) +
+  geom_point(size = 1, alpha = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1, alpha = 0.2) +
+  scale_y_continuous(breaks = seq(0, 3, by = 1)) +
+  coord_cartesian(ylim = c(-0.15,2.25), xlim = c(0,12.5))+
+  scale_color_manual(values = cols) +
+  scale_fill_manual(values = cols) +
+  theme_bw(base_size = 9) +
+  labs(
+    x = "Within-plot standard deviation in tree height (m)",
+    y = "Among-method standard deviation in torching index (km h⁻¹)",
+    color = "Forest Type",
+    fill = "Forest Type"
+  ) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank())
+
+y_positions <- c(
+  "pinyon-juniper" = -0.22,
+  "ponderosa pine" = -0.15,
+  "mixed conifer"  = -0.08,
+  "spruce-fir"     = -0.01
+)
+
+x_annot <- max(CBH_complexity$Stand_complexity_CV, na.rm = TRUE)
+
+for (i in seq_len(nrow(lm_results))) {
+  ft <- as.character(lm_results$ForTyp[i])
+  TI_complexity_plot_SB3 <- TI_complexity_plot_SB3 + annotate(
+    "text",
+    x = 12.5,
+    y = y_positions[ft],
+    label = lm_results$label[i],
+    hjust = 1,
+    size = 3,
+    color = cols[ft]
+  )
+}
+
+TI_complexity_plot_SB3 <- TI_complexity_plot_SB3 + annotate("text",
+    x = -0.15,
+    y = 1.985,
+    label = "Fuel model SB3: \nHigh load activity fuel",
+    hjust = 0,
+    size = 5,
+    color = "black"
+  )
+
+TI_complexity_plot_SB3 <- TI_complexity_plot_SB3 + annotate("text",
+    x = -0.15,
+    y = 2.25,
+    label = "C)",
+    hjust = 0,
+    size = 7,
+    color = "black"
+  )
+
+TI_complexity_plot_SB3
+
+# Scott and Burgen Fuel Models
+TI_var_across_plots <- TI %>%
+  group_by(Plot) %>%
+  summarise(
+    SD_TI_kmh = sd(TI_kmh, na.rm = TRUE),
+    mean_TI_kmh = mean(TI_kmh, na.rm = TRUE),
+    CV_TI_kmh = SD_TI_kmh / mean_TI_kmh,
+    .groups = "drop"
+  )
+
+TI_complexity <- left_join(TI_var_across_plots, Height_var, by = "Plot")
+
+lm_results <- TI_complexity %>%
+  group_by(ForTyp) %>%
+  group_modify(~{
+    model <- lm(SD_TI_kmh ~ SD_height, data = .x)
+    tidy_mod <- tidy(model)
+    glance_mod <- glance(model)
+    tibble(
+      intercept = tidy_mod$estimate[tidy_mod$term == "(Intercept)"],
+      slope     = tidy_mod$estimate[tidy_mod$term == "SD_height"],
+      r2        = glance_mod$r.squared,
+      p         = round(glance_mod$p.value, digits = 4)
+    )
+  }) %>%
+  ungroup() %>%
+  arrange(ForTyp) %>%
+  mutate(
+   label = sprintf("%s: y = %.2f + %.2fx,   R² = %.2f,   p = %.2f", ForTyp, intercept, slope, r2, p)
+  )
+
+TI_complexity_plot_SB <- ggplot(TI_complexity, aes(x = SD_height, y = SD_TI_kmh, color = ForTyp, fill = ForTyp)) +
+  geom_point(size = 1, alpha = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1, alpha = 0.2) +
+  scale_y_continuous(breaks = seq(0, 50, by = 15)) +
+  coord_cartesian(ylim = c(-10,45), xlim = c(0,12.5))+
+  scale_color_manual(values = cols) +
+  scale_fill_manual(values = cols) +
+  theme_bw(base_size = 9) +
+  labs(
+    x = "Within-plot standard deviation in tree height (m)",
+    y = "Among-method standard deviation in torching index (km h⁻¹)",
+    color = "Forest Type",
+    fill = "Forest Type"
+  ) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank())
+
+y_positions <- c(
+  "pinyon-juniper" = 27,
+  "ponderosa pine" = 28.5,
+  "mixed conifer"  = 30,
+  "spruce-fir"     = 31.5
+)
+
+x_annot <- max(CBH_complexity$Stand_complexity_CV, na.rm = TRUE)
+
+for (i in seq_len(nrow(lm_results))) {
+  ft <- as.character(lm_results$ForTyp[i])
+  TI_complexity_plot_SB <- TI_complexity_plot_SB + annotate(
+    "text",
+    x = 12.5,
+    y = y_positions[ft],
+    label = lm_results$label[i],
+    hjust = 1,
+    size = 3,
+    color = cols[ft]
+  )
+}
+
+TI_complexity_plot_SB <- TI_complexity_plot_SB + annotate("text",
+    x = -0.15,
+    y = 45,
+    label = "D)",
+    hjust = 0,
+    size = 7,
+    color = "black"
+  )
+
+TI_complexity_plot_SB <- TI_complexity_plot_SB + annotate("text",
+    x = -0.15,
+    y = 39.7,
+    label = "LANDFIRE predicted \nScott and Burgan fuel models",
+    hjust = 0,
+    size = 5,
+    color = "black"
+  )
+
+TI_complexity_plot_SB
+
+# Combine Plots
+TI_sup_toprow <- cowplot::plot_grid(
+  TI_complexity_plot_TL1,
+  TI_complexity_plot_GS2,
+  nrow = 1,
+  rel_widths = c(1, 1),
+  rel_heights = c(1, 1)
+)
+
+TI_sup_bottomrow <- cowplot::plot_grid(
+  TI_complexity_plot_SB3,
+  TI_complexity_plot_SB,
+  nrow = 1,
+  rel_widths = c(1, 1),
+  rel_heights = c(1, 1)
+)
+
+TI_sup <- cowplot::plot_grid(
+  TI_sup_toprow,
+  TI_sup_bottomrow,
+  nrow = 2,
+  rel_widths = c(1, 1),
+  rel_heights = c(1, 1)
+)
+TI_sup
+```
+

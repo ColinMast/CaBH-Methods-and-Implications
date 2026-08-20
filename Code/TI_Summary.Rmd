@@ -1,0 +1,843 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r Load Libraries}
+library(tidyverse)
+library(terra)
+library(tidyterra)
+library(firebehavioR)
+library(ggtext)
+library(cowplot)
+
+options(scipen = 999)
+options(timeout = 10000)
+
+Plot_locations <- vect("Data/Plots/Campaign2023_Plots.shp")
+```
+
+
+```{r Summarize Fuel and Topography}
+#Scott and Burgen 40 
+FM_Map_SB <- rast("C:/Users/Colin/OneDrive - Colostate/PhD/Research/GeoSpatialProducts/Data/RawData/LandFire/LF2023_FBFM40_240_CONUS/LF2023_FBFM40_240_CONUS/Tif/LC23_F40_240.tif") # File path to LANDFIRE Scott and Burgen 2023 surface fuel model raster
+Plots <- project(Plot_locations, FM_Map_SB)
+Plot_FM_SB <- as.data.frame(terra::extract(FM_Map_SB, Plots, fun = "modal", bind = TRUE))
+colnames(Plot_FM_SB)[20] <- "VALUE"
+FM_LUT_SB <- read.csv("C:/Users/Colin/OneDrive - Colostate/PhD/Research/GeoSpatialProducts/Data/RawData/LandFire/LF2023_FBFM40_240_CONUS/LF2023_FBFM40_240_CONUS/CSV_Data/LF23_F40_240.csv") %>% select(VALUE, FBFM40) # File path to LANDFIRE Scott and Burgen 2023 surface fuel model look-up table
+Plot_FM_SB <- left_join(Plot_FM_SB, FM_LUT_SB, by = "VALUE")
+
+# CBD
+CBD_Map <- rast("C:/Users/Colin/OneDrive - Colostate/PhD/Research/GeoSpatialProducts/Data/RawData/LandFire/LF2023_CBD_240_CONUS/LF2023_CBD_240_CONUS/Tif/LC23_CBD_240.tif") # File path to LANDFIRE 2023 canopy bulk density raster
+Plots <- project(Plots, CBD_Map)
+Plot_CBD <- as.data.frame(terra::extract(CBD_Map, Plots, weights = TRUE, fun = "mean", bind = TRUE))
+
+# Slope 
+Slope_Map <- rast("C:/Users/Colin/OneDrive - Colostate/PhD/Research/WesternFire/Data/Old_Input/Topography/LC20_SlpD_220.tif") # File path to LANDFIRE slope raster
+Plots <- project(Plots, Slope_Map)
+Plot_Slope <- as.data.frame(terra::extract(Slope_Map, Plots, weights = TRUE, fun = "mean", bind = TRUE))
+
+# Canopy cover 
+CanopyCover <- rast("Data/Subset__CC.tif") 
+Plots <- project(Plots, CanopyCover)
+Plot_CC <- as.data.frame(terra::extract(CanopyCover, Plots, fun = "mean", weights = TRUE, bind = TRUE, na.rm=TRUE))
+
+# Canopy Height
+CanopyHeight <- rast("Data/Subset__chm10.tif")
+Plots <- project(Plots, CanopyHeight)
+Plot_CH <- as.data.frame(terra::extract(CanopyHeight, Plots, fun = "mean", weights = TRUE, bind = TRUE, na.rm=TRUE))
+
+# Forest type 
+ForTyp <- CaBH_Comparison %>% select(Plot, ForTyp) # From CaBH_Summary
+
+Final_Inputs <- data.frame(Plot = Plot_FM_SB$Plot,
+                              FM_SB = Plot_FM_SB$FBFM40,
+                              CBD = Plot_CBD$KGM3_X_100/100,
+                              slope = Plot_Slope$LC20_SlpD_220,
+                              CH = Plot_CH$max,
+                              CanCov = Plot_CC$count)
+
+Plots_data <- left_join(Final_Inputs, ForTyp, by = "Plot") %>%
+  filter(Plot != 4)%>% # remove plot without species informaiton 
+  filter(Plot != 17)%>% # remove single aspen dominated plot
+  filter(!Plot %in% c(21, 22, 28, 36, 38, 39, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 100, 102, 103, 104, 106)) # Remove plots disturbed by fire or management since 2017
+```
+
+
+```{r Model Torching Index}
+data(fuelModels, fuelMoisture)
+fuelModels_tbl <- rownames_to_column(fuelModels, var = "FM")
+
+# Plot Data
+CaBH_values <- CaBH_Comparison # From CaBH_Summary
+
+colnames(Plots_data)[2] <- "FM"
+
+Plots_data_ready  <- CaBH_values %>%
+  pivot_longer(cols = 3:17, names_to = "CaBH_method",values_to = "CBH")%>%
+  left_join(Plots_data, by = c("Plot", "ForTyp"))%>%
+  mutate(CFL = CBD * (CH - CBH),
+         FMC = 90,
+         direction = 0,
+         windspeed = 250,
+         CanCov = CanCov * 100)%>%
+  left_join(fuelModels_tbl, by = "FM")
+
+Plots_data_ready <- Plots_data_ready %>%
+  mutate(WAF = waf(
+         fuelDepth = fuelBedDepth,
+         forestHt = CH,
+         cr = ((CH - CBH)/CH *100),
+         cc = CanCov))%>%
+  ungroup()
+
+moist = fuelMoisture["D1L1", ]
+unique(Plots_data_ready$FM)
+
+# TU5 
+TU5_data <- Plots_data_ready %>%
+  filter(FM == "TU5")
+
+surfFuel = fuelModels["TU5", , drop = FALSE] 
+moist = fuelMoisture["D1L1", ]
+
+crownFuel <- as.data.frame(TU5_data %>% select(CBD, FMC, CBH, CFL))
+enviro <- as.data.frame(TU5_data %>% select(slope, windspeed, direction, waf = WAF))
+
+TU5_list <- vector("list", nrow(crownFuel))
+
+for (i in seq_len(nrow(crownFuel))) {
+  out <- rothermel(
+    surfFuel  = surfFuel,
+    moist     = moist,
+    crownFuel = crownFuel[i, , drop = FALSE],
+    enviro    = enviro[i, , drop = FALSE])
+  TU5_list[[i]] <- out$fireBehavior
+}
+
+TU5_TI_df <- do.call(rbind, TU5_list)
+TU5_results <- bind_cols(TU5_data, TU5_TI_df)
+
+# TL8 
+TL8_data <- Plots_data_ready %>%
+  filter(FM == "TL8")
+
+surfFuel = fuelModels["TL8", , drop = FALSE] 
+moist = fuelMoisture["D1L1", ]
+
+crownFuel <- as.data.frame(TL8_data %>% select(CBD, FMC, CBH, CFL))
+enviro <- as.data.frame(TL8_data %>% select(slope, windspeed, direction, waf = WAF))
+
+TL8_list <- vector("list", nrow(crownFuel))
+
+for (i in seq_len(nrow(crownFuel))) {
+  out <- rothermel(
+    surfFuel  = surfFuel,
+    moist     = moist,
+    crownFuel = crownFuel[i, , drop = FALSE],
+    enviro    = enviro[i, , drop = FALSE])
+  TL8_list[[i]] <- out$fireBehavior
+}
+
+TL8_TI_df <- do.call(rbind, TL8_list)
+TL8_results <- bind_cols(TL8_data, TL8_TI_df)
+
+
+# TU1 
+TU1_data <- Plots_data_ready %>%
+  filter(FM == "TU1")
+
+surfFuel = fuelModels["TU1", , drop = FALSE] 
+moist = fuelMoisture["D1L1", ]
+
+crownFuel <- as.data.frame(TU1_data %>% select(CBD, FMC, CBH, CFL))
+enviro <- as.data.frame(TU1_data %>% select(slope, windspeed, direction, waf = WAF))
+
+TU1_list <- vector("list", nrow(crownFuel))
+
+for (i in seq_len(nrow(crownFuel))) {
+  out <- rothermel(
+    surfFuel  = surfFuel,
+    moist     = moist,
+    crownFuel = crownFuel[i, , drop = FALSE],
+    enviro    = enviro[i, , drop = FALSE])
+  TU1_list[[i]] <- out$fireBehavior
+}
+
+TU1_TI_df <- do.call(rbind, TU1_list)
+TU1_results <- bind_cols(TU1_data, TU1_TI_df)
+
+# SB3 
+SB3_data <- Plots_data_ready %>%
+  filter(FM == "SB3")
+
+surfFuel = fuelModels["SB3", , drop = FALSE] 
+moist = fuelMoisture["D1L1", ]
+
+crownFuel <- as.data.frame(SB3_data %>% select(CBD, FMC, CBH, CFL))
+enviro <- as.data.frame(SB3_data %>% select(slope, windspeed, direction, waf = WAF))
+
+SB3_list <- vector("list", nrow(crownFuel))
+
+for (i in seq_len(nrow(crownFuel))) {
+  out <- rothermel(
+    surfFuel  = surfFuel,
+    moist     = moist,
+    crownFuel = crownFuel[i, , drop = FALSE],
+    enviro    = enviro[i, , drop = FALSE])
+  SB3_list[[i]] <- out$fireBehavior
+}
+
+SB3_TI_df <- do.call(rbind, SB3_list)
+SB3_results <- bind_cols(SB3_data, SB3_TI_df)
+
+
+# GS2
+GS2_data <- Plots_data_ready %>%
+  filter(FM == "GS2")
+
+surfFuel = fuelModels["GS2", , drop = FALSE] 
+moist = fuelMoisture["D1L1", ]
+
+crownFuel <- as.data.frame(GS2_data %>% select(CBD, FMC, CBH, CFL))
+enviro <- as.data.frame(GS2_data %>% select(slope, windspeed, direction, waf = WAF))
+
+GS2_list <- vector("list", nrow(crownFuel))
+
+for (i in seq_len(nrow(crownFuel))) {
+  out <- rothermel(
+    surfFuel  = surfFuel,
+    moist     = moist,
+    crownFuel = crownFuel[i, , drop = FALSE],
+    enviro    = enviro[i, , drop = FALSE])
+  GS2_list[[i]] <- out$fireBehavior
+}
+
+GS2_TI_df <- do.call(rbind, GS2_list)
+GS2_results <- bind_cols(GS2_data, GS2_TI_df)
+
+# TL3
+TL3_data <- Plots_data_ready %>%
+  filter(FM == "TL3")
+
+surfFuel = fuelModels["TL3", , drop = FALSE] 
+moist = fuelMoisture["D1L1", ]
+
+crownFuel <- as.data.frame(TL3_data %>% select(CBD, FMC, CBH, CFL))
+enviro <- as.data.frame(TL3_data %>% select(slope, windspeed, direction, waf = WAF))
+
+TL3_list <- vector("list", nrow(crownFuel))
+
+for (i in seq_len(nrow(crownFuel))) {
+  out <- rothermel(
+    surfFuel  = surfFuel,
+    moist     = moist,
+    crownFuel = crownFuel[i, , drop = FALSE],
+    enviro    = enviro[i, , drop = FALSE])
+  TL3_list[[i]] <- out$fireBehavior
+}
+
+TL3_TI_df <- do.call(rbind, TL3_list)
+TL3_results <- bind_cols(TL3_data, TL3_TI_df)
+
+# GR2
+GR2_data <- Plots_data_ready %>%
+  filter(FM == "GR2")
+
+surfFuel = fuelModels["GR2", , drop = FALSE] 
+moist = fuelMoisture["D1L1", ]
+
+crownFuel <- as.data.frame(GR2_data %>% select(CBD, FMC, CBH, CFL))
+enviro <- as.data.frame(GR2_data %>% select(slope, windspeed, direction, waf = WAF))
+
+GR2_list <- vector("list", nrow(crownFuel))
+
+for (i in seq_len(nrow(crownFuel))) {
+  out <- rothermel(
+    surfFuel  = surfFuel,
+    moist     = moist,
+    crownFuel = crownFuel[i, , drop = FALSE],
+    enviro    = enviro[i, , drop = FALSE])
+  GR2_list[[i]] <- out$fireBehavior
+}
+
+GR2_TI_df <- do.call(rbind, GR2_list)
+GR2_results <- bind_cols(GR2_data, GR2_TI_df)
+
+# SH2
+SH2_data <- Plots_data_ready %>%
+  filter(FM == "SH2")
+
+surfFuel = fuelModels["SH2", , drop = FALSE] 
+moist = fuelMoisture["D1L1", ]
+
+crownFuel <- as.data.frame(SH2_data %>% select(CBD, FMC, CBH, CFL))
+enviro <- as.data.frame(SH2_data %>% select(slope, windspeed, direction, waf = WAF))
+
+SH2_list <- vector("list", nrow(crownFuel))
+
+for (i in seq_len(nrow(crownFuel))) {
+  out <- rothermel(
+    surfFuel  = surfFuel,
+    moist     = moist,
+    crownFuel = crownFuel[i, , drop = FALSE],
+    enviro    = enviro[i, , drop = FALSE])
+  SH2_list[[i]] <- out$fireBehavior
+}
+
+SH2_TI_df <- do.call(rbind, SH2_list)
+SH2_results <- bind_cols(SH2_data, SH2_TI_df)
+
+# TL5
+TL5_data <- Plots_data_ready %>%
+  filter(FM == "TL5")
+
+surfFuel = fuelModels["TL5", , drop = FALSE] 
+moist = fuelMoisture["D1L1", ]
+
+crownFuel <- as.data.frame(TL5_data %>% select(CBD, FMC, CBH, CFL))
+enviro <- as.data.frame(TL5_data %>% select(slope, windspeed, direction, waf = WAF))
+
+TL5_list <- vector("list", nrow(crownFuel))
+
+for (i in seq_len(nrow(crownFuel))) {
+  out <- rothermel(
+    surfFuel  = surfFuel,
+    moist     = moist,
+    crownFuel = crownFuel[i, , drop = FALSE],
+    enviro    = enviro[i, , drop = FALSE])
+  TL5_list[[i]] <- out$fireBehavior
+}
+
+TL5_TI_df <- do.call(rbind, TL5_list)
+TL5_results <- bind_cols(TL5_data, TL5_TI_df)
+
+# TL1
+TL1_data <- Plots_data_ready %>%
+  filter(FM == "TL1")
+
+surfFuel = fuelModels["TL1", , drop = FALSE] 
+moist = fuelMoisture["D1L1", ]
+
+crownFuel <- as.data.frame(TL1_data %>% select(CBD, FMC, CBH, CFL))
+enviro <- as.data.frame(TL1_data %>% select(slope, windspeed, direction, waf = WAF))
+
+TL1_list <- vector("list", nrow(crownFuel))
+
+for (i in seq_len(nrow(crownFuel))) {
+  out <- rothermel(
+    surfFuel  = surfFuel,
+    moist     = moist,
+    crownFuel = crownFuel[i, , drop = FALSE],
+    enviro    = enviro[i, , drop = FALSE])
+  TL1_list[[i]] <- out$fireBehavior
+}
+
+TL1_TI_df <- do.call(rbind, TL1_list)
+TL1_results <- bind_cols(TL1_data, TL1_TI_df)
+
+# TU2
+TU2_data <- Plots_data_ready %>%
+  filter(FM == "TU2")
+
+surfFuel = fuelModels["TU2", , drop = FALSE] 
+moist = fuelMoisture["D1L1", ]
+
+crownFuel <- as.data.frame(TU2_data %>% select(CBD, FMC, CBH, CFL))
+enviro <- as.data.frame(TU2_data %>% select(slope, windspeed, direction, waf = WAF))
+
+TU2_list <- vector("list", nrow(crownFuel))
+
+for (i in seq_len(nrow(crownFuel))) {
+  out <- rothermel(
+    surfFuel  = surfFuel,
+    moist     = moist,
+    crownFuel = crownFuel[i, , drop = FALSE],
+    enviro    = enviro[i, , drop = FALSE])
+  TU2_list[[i]] <- out$fireBehavior
+}
+
+TU2_TI_df <- do.call(rbind, TU2_list)
+TU2_results <- bind_cols(TU2_data, TU2_TI_df)
+
+# GS1
+GS1_data <- Plots_data_ready %>%
+  filter(FM == "GS1")
+
+surfFuel = fuelModels["GS1", , drop = FALSE] 
+moist = fuelMoisture["D1L1", ]
+
+crownFuel <- as.data.frame(GS1_data %>% select(CBD, FMC, CBH, CFL))
+enviro <- as.data.frame(GS1_data %>% select(slope, windspeed, direction, waf = WAF))
+
+GS1_list <- vector("list", nrow(crownFuel))
+
+for (i in seq_len(nrow(crownFuel))) {
+  out <- rothermel(
+    surfFuel  = surfFuel,
+    moist     = moist,
+    crownFuel = crownFuel[i, , drop = FALSE],
+    enviro    = enviro[i, , drop = FALSE])
+  GS1_list[[i]] <- out$fireBehavior
+}
+
+GS1_TI_df <- do.call(rbind, GS1_list)
+GS1_results <- bind_cols(GS1_data, GS1_TI_df)
+
+# Join
+TI_results <- rbind(TU5_results, TL8_results, TU1_results, SB3_results, 
+                    GS2_results, TL3_results, GR2_results, SH2_results, 
+                    TL5_results, TL1_results, TU2_results, GS1_results)
+
+TI <- TI_results %>%
+  mutate(TI_kmh = `Torching Index [m/min]` * 0.06) #`Torching Index [m/min]` * 0.06)
+
+TI %>%
+  group_by(Plot)%>%
+  summarize(Max_TI = max(TI_kmh),
+            Min_TI = min(TI_kmh),
+            Range_TI = Max_TI - Min_TI)%>%
+  ungroup()%>%
+  summarise(Mean_TI_Range = mean(Range_TI))
+
+TI$ForTyp <- factor(TI$ForTyp, 
+                    levels = c("pinyon-juniper", "ponderosa pine", "mixed conifer", "spruce-fir"), 
+                    labels = c("pinyon-juniper\n(n=22)" ,"ponderosa pine\n(n = 40)", "mixed conifer\n(n = 15)", "spruce-fir\n(n=16)"))
+
+TI_summary <- TI %>%
+  group_by(ForTyp, CaBH_method)%>%
+  summarise(count = n_distinct(Plot),
+            mean_TI = mean(TI_kmh, na.rm = TRUE),
+            se_TI   = sd(TI_kmh, na.rm = TRUE) / sqrt(count),
+            .groups = "drop")
+
+palette <- rev(c(
+  "#08519c", "#3182bd", "#6baed6", "#bdd7e7", 
+  "#a63603", "#e6550d", "#fd8d3c", "#fdbe85",  
+  "#54278f", "#756bb1", "#9e9ac8", "#cbc9e2", 
+  "#78C042", "#D9EF9E", "#636363"
+))
+
+
+ggplot(TI_summary, aes(y = CaBH_method, x = mean_TI, fill = CaBH_method)) +
+  geom_col() +
+  geom_errorbar(aes(xmin = mean_TI - se_TI, xmax = mean_TI + se_TI),
+              linewidth = 0.25, width = 0.2) +
+  labs(
+    #title = "Scott and Burgan Fuel Models",
+    y = "CBH Method",
+    x = "torching index (km/hr)",
+    fill = "CaBH \nharacterization \napproach"
+  ) +
+  guides(fill = guide_legend(reverse = TRUE))+
+  scale_fill_manual(values = palette,
+                    labels = c(
+  "Field_Mean" = "Field Mean CrBH",
+  "LiDAR_Mean" = "LiDAR Mean CrBH",
+  "GEE_Mean"   = "GEE Mean CrBH",
+  "Field_Med"  = "Field Median CrBH",
+  "LiDAR_Med"  = "LiDAR Median CrBH",
+  "GEE_Med"    = "GEE Median CrBH",
+  "Field_20th" = "Field 20th Percentile CrBH", 
+  "LiDAR_20th" = "LiDAR 20th Percentile CrBH", 
+  "GEE_20th"   = "GEE 20th Percentile CrBH", 
+  "Field_Min"  = "Field Minimum CrBH", 
+  "LiDAR_Min"  = "LiDAR Minimum CrBH", 
+  "GEE_Min"    = "GEE Minimum CrBH", 
+  "FVS_noCR"   = "FVS without crown ratio",  
+  "FVS_CR"     = "FVS with crown ratio",
+  "LANDFIRE"   = "LANDFIRE"
+)) +
+#  xlim(c(0,40))+
+  theme_bw(base_size = 12) +
+  theme(#axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.y = element_blank()
+        #legend.position = "none"
+        )+
+    facet_wrap(~ ForTyp, ncol = 2, scales = "free_x") 
+```
+
+
+```{r Supplemental Figure 2}
+# TL1 - Low load compact conifer litter
+surfFuel = fuelModels["TL1", , drop = FALSE] 
+moist = fuelMoisture["D1L1", ]
+
+crownFuel <- as.data.frame(Plots_data_ready %>% select(CBD, FMC, CBH, CFL))
+enviro <- as.data.frame(Plots_data_ready %>% select(slope, windspeed, direction, waf = WAF))
+
+SingleModel_list <- vector("list", nrow(crownFuel))
+
+for (i in seq_len(nrow(crownFuel))) {
+  out <- rothermel(
+    surfFuel  = surfFuel,
+    moist     = moist,
+    crownFuel = crownFuel[i, , drop = FALSE],
+    enviro    = enviro[i, , drop = FALSE])
+  SingleModel_list[[i]] <- out$fireBehavior
+}
+
+SingleModel_df <- do.call(rbind, SingleModel_list)
+SingleModel_results <- bind_cols(Plots_data_ready, SingleModel_df)
+
+TI_TL1 <- SingleModel_results
+
+TI_TL1 <- TI_TL1 %>%
+  mutate(TI_kmh = `Torching Index [m/min]` * 0.06)
+
+TI_TL1$ForTyp <- factor(TI_TL1$ForTyp, levels = c("pinyon-juniper", "ponderosa pine", "mixed conifer", "spruce-fir"))
+
+TI_summary <- TI_TL1 %>%
+  group_by(ForTyp, CaBH_method)%>%
+  summarise(count = n_distinct(Plot),
+            mean_TI = mean(TI_kmh, na.rm = TRUE),
+            se_TI   = sd(TI_kmh, na.rm = TRUE) / sqrt(count),
+            .groups = "drop")
+
+TI_summary$CaBH_method <- factor(TI_summary$CaBH_method, 
+                         levels = c("LANDFIRE", "FVS_CR", "FVS_noCR",  
+                                    "Sentinel_Min", "Sentinel_20th", "Sentinel_Median", "Sentinel_Mean",
+                                    "LiDAR_Min", "LiDAR_20th", "LiDAR_Med", "LiDAR_Mean",
+                                    "Field_Min", "Field_20th", "Field_Med", "Field_Mean"))
+
+palette <- rev(c(
+  "#08519c", "#3182bd", "#6baed6", "#bdd7e7", 
+  "#a63603", "#e6550d", "#fd8d3c", "#fdbe85",  
+  "#54278f", "#756bb1", "#9e9ac8", "#cbc9e2", 
+  "#78C042", "#D9EF9E", "#636363"
+))
+
+
+ggplot(TI_summary, aes(y = CaBH_method, x = mean_TI, fill = CaBH_method)) +
+  geom_col() +
+  geom_errorbar(aes(xmin = mean_TI - se_TI, xmax = mean_TI + se_TI),
+                position = position_dodge(width = 0.9), width = 0.2) +
+  labs(
+    title = "**A)** TL1 - Low load compact conifer litter",
+    y = "CBH Method",
+    x = "Torching Index (km/hr)",
+    fill = "Forest type"
+  ) +
+  scale_fill_manual(values = palette,
+                    labels = c(
+  "Field_Mean" = "Field Mean CrBH",
+  "LiDAR_Mean" = "LiDAR Mean CrBH",
+  "GEE_Mean"   = "GEE Mean CrBH",
+  "Field_Med"  = "Field Median CrBH",
+  "LiDAR_Med"  = "LiDAR Median CrBH",
+  "GEE_Med"    = "GEE Median CrBH",
+  "Field_20th" = "Field 20th Percentile CrBH", 
+  "LiDAR_20th" = "LiDAR 20th Percentile CrBH", 
+  "GEE_20th"   = "GEE 20th Percentile CrBH", 
+  "Field_Min"  = "Field Minimum CrBH", 
+  "LiDAR_Min"  = "LiDAR Minimum CrBH", 
+  "GEE_Min"    = "GEE Minimum CrBH", 
+  "FVS_noCR"   = "FVS without crown ratio",  
+  "FVS_CR"     = "FVS with crown ratio",
+  "LANDFIRE"   = "LANDFIRE"
+)) +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_markdown(),
+        legend.position = "none",
+         axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.y = element_blank())+
+    facet_wrap(~ ForTyp, ncol = 2, scales = "fixed") 
+
+# GS2 - Moderate load dry climate grass-shrub
+surfFuel = fuelModels["GS2", , drop = FALSE] 
+moist = fuelMoisture["D1L1", ]
+
+crownFuel <- as.data.frame(Plots_data_ready %>% select(CBD, FMC, CBH, CFL))
+enviro <- as.data.frame(Plots_data_ready %>% select(slope, windspeed, direction, waf = WAF))
+
+SingleModel_list <- vector("list", nrow(crownFuel))
+
+for (i in seq_len(nrow(crownFuel))) {
+  out <- rothermel(
+    surfFuel  = surfFuel,
+    moist     = moist,
+    crownFuel = crownFuel[i, , drop = FALSE],
+    enviro    = enviro[i, , drop = FALSE])
+  SingleModel_list[[i]] <- out$fireBehavior
+}
+
+SingleModel_df <- do.call(rbind, SingleModel_list)
+SingleModel_results <- bind_cols(Plots_data_ready, SingleModel_df)
+
+TI_GS2 <- SingleModel_results
+
+TI_GS2 <- TI_GS2 %>%
+  mutate(TI_kmh = `Torching Index [m/min]` * 0.06)
+
+TI_GS2$ForTyp <- factor(TI_GS2$ForTyp, levels = c("pinyon-juniper", "ponderosa pine", "mixed conifer", "spruce-fir"))
+
+TI_summary <- TI_GS2 %>%
+  group_by(ForTyp, CaBH_method)%>%
+  summarise(count = n_distinct(Plot),
+            mean_TI = mean(TI_kmh, na.rm = TRUE),
+            se_TI   = sd(TI_kmh, na.rm = TRUE) / sqrt(count),
+            .groups = "drop")
+
+TI_summary$CaBH_method <- factor(TI_summary$CaBH_method, 
+                         levels = c("LANDFIRE", "FVS_CR", "FVS_noCR",  
+                                    "Sentinel_Min", "Sentinel_20th", "Sentinel_Median", "Sentinel_Mean",
+                                    "LiDAR_Min", "LiDAR_20th", "LiDAR_Med", "LiDAR_Mean",
+                                    "Field_Min", "Field_20th", "Field_Med", "Field_Mean"))
+
+ggplot(TI_summary, aes(y = CaBH_method, x = mean_TI, fill = CaBH_method)) +
+  geom_col() +
+  geom_errorbar(aes(xmin = mean_TI - se_TI, xmax = mean_TI + se_TI),
+                position = position_dodge(width = 0.9), width = 0.2) +
+  labs(
+    title = "**B)** GS2 - Moderate load dry climate grass-shrub",
+    y = "CBH Method",
+    x = "Torching Index (km/hr)",
+    fill = "Forest type"
+  ) +
+  scale_fill_manual(values = palette,
+                    labels = c(
+  "Field_Mean" = "Field Mean CrBH",
+  "LiDAR_Mean" = "LiDAR Mean CrBH",
+  "GEE_Mean"   = "GEE Mean CrBH",
+  "Field_Med"  = "Field Median CrBH",
+  "LiDAR_Med"  = "LiDAR Median CrBH",
+  "GEE_Med"    = "GEE Median CrBH",
+  "Field_20th" = "Field 20th Percentile CrBH", 
+  "LiDAR_20th" = "LiDAR 20th Percentile CrBH", 
+  "GEE_20th"   = "GEE 20th Percentile CrBH", 
+  "Field_Min"  = "Field Minimum CrBH", 
+  "LiDAR_Min"  = "LiDAR Minimum CrBH", 
+  "GEE_Min"    = "GEE Minimum CrBH", 
+  "FVS_noCR"   = "FVS without crown ratio",  
+  "FVS_CR"     = "FVS with crown ratio",
+  "LANDFIRE"   = "LANDFIRE"
+)) +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_markdown(),
+        legend.position = "none",
+         axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.y = element_blank())+
+    facet_wrap(~ ForTyp, ncol = 2, scales = "fixed") 
+
+# SB3 - High load activity fuel
+surfFuel = fuelModels["SB3", , drop = FALSE] 
+moist = fuelMoisture["D1L1", ]
+
+crownFuel <- as.data.frame(Plots_data_ready %>% select(CBD, FMC, CBH, CFL))
+enviro <- as.data.frame(Plots_data_ready %>% select(slope, windspeed, direction, waf = WAF))
+
+SingleModel_list <- vector("list", nrow(crownFuel))
+
+for (i in seq_len(nrow(crownFuel))) {
+  out <- rothermel(
+    surfFuel  = surfFuel,
+    moist     = moist,
+    crownFuel = crownFuel[i, , drop = FALSE],
+    enviro    = enviro[i, , drop = FALSE])
+  SingleModel_list[[i]] <- out$fireBehavior
+}
+
+SingleModel_df <- do.call(rbind, SingleModel_list)
+SingleModel_results <- bind_cols(Plots_data_ready, SingleModel_df)
+
+TI_SB3 <- SingleModel_results
+
+TI_SB3 <- TI_SB3 %>%
+  mutate(TI_kmh = `Torching Index [m/min]` * 0.06)
+
+TI_SB3$ForTyp <- factor(TI_SB3$ForTyp, levels = c("pinyon-juniper", "ponderosa pine", "mixed conifer", "spruce-fir"))
+
+TI_summary <- TI_SB3 %>%
+  group_by(ForTyp, CaBH_method)%>%
+  summarise(count = n_distinct(Plot),
+            mean_TI = mean(TI_kmh, na.rm = TRUE),
+            se_TI   = sd(TI_kmh, na.rm = TRUE) / sqrt(count),
+            .groups = "drop")
+
+TI_summary$CaBH_method <- factor(TI_summary$CaBH_method, 
+                         levels = c("LANDFIRE", "FVS_CR", "FVS_noCR",  
+                                    "Sentinel_Min", "Sentinel_20th", "Sentinel_Median", "Sentinel_Mean",
+                                    "LiDAR_Min", "LiDAR_20th", "LiDAR_Med", "LiDAR_Mean",
+                                    "Field_Min", "Field_20th", "Field_Med", "Field_Mean"))
+
+ggplot(TI_summary, aes(y = CaBH_method, x = mean_TI, fill = CaBH_method)) +
+  geom_col() +
+  geom_errorbar(aes(xmin = mean_TI - se_TI, xmax = mean_TI + se_TI),
+                position = position_dodge(width = 0.9), width = 0.2) +
+  labs(
+    title = "**C)** SB3 - High load activity fuel",
+    y = "CBH Method",
+    x = "Torching Index (km/hr)",
+    fill = "Forest type"
+  ) +
+  scale_fill_manual(values = palette,
+                    labels = c(
+  "Field_Mean" = "Field Mean CrBH",
+  "LiDAR_Mean" = "LiDAR Mean CrBH",
+  "GEE_Mean"   = "GEE Mean CrBH",
+  "Field_Med"  = "Field Median CrBH",
+  "LiDAR_Med"  = "LiDAR Median CrBH",
+  "GEE_Med"    = "GEE Median CrBH",
+  "Field_20th" = "Field 20th Percentile CrBH", 
+  "LiDAR_20th" = "LiDAR 20th Percentile CrBH", 
+  "GEE_20th"   = "GEE 20th Percentile CrBH", 
+  "Field_Min"  = "Field Minimum CrBH", 
+  "LiDAR_Min"  = "LiDAR Minimum CrBH", 
+  "GEE_Min"    = "GEE Minimum CrBH", 
+  "FVS_noCR"   = "FVS without crown ratio",  
+  "FVS_CR"     = "FVS with crown ratio",
+  "LANDFIRE"   = "LANDFIRE"
+)) +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_markdown(),
+        legend.position = "none",
+         axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.y = element_blank())+
+    facet_wrap(~ ForTyp, ncol = 2, scales = "fixed")
+```
+
+
+```{r}
+Plot_FMs <- Plots_data %>%
+  mutate(FM_SB_group = substr(FM, 1, nchar(FM) - 1)) %>%
+  group_by(ForTyp, FM_SB_group) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(ForTyp) %>%
+  mutate(
+    total   = sum(count),
+    Percent = count / total *100
+  ) %>%
+  ungroup()
+
+palette <- rev(c(
+  "GR" = "chartreuse1", 
+  "GS" = "olivedrab4",  
+  "SH" = "darkgreen",  
+  "TL" = "tan",  
+  "TU" = "tan4", 
+  "SB" = "brown4"   
+))
+
+Plot_FMs$FM_SB_group <- factor(Plot_FMs$FM_SB_group, levels = c("SB", "TU", "TL", "SH", "GS", "GR"))
+Plot_FMs$ForTyp <- factor(Plot_FMs$ForTyp, levels = c("pinyon-juniper", "ponderosa pine", "mixed conifer", "spruce-fir"), labels = c("pinyon-juniper\n(n=22)", "ponderosa pine\n(n = 40)", "mixed conifer\n(n = 15)", "spruce-fir\n(n=16)"))
+
+SFM_breakdown <- Plot_FMs %>%
+  ggplot(aes(y = Percent, x = ForTyp, fill = FM_SB_group))+
+  geom_bar(position = "stack", stat = "identity")+
+  scale_fill_manual(values = palette,
+                    name = "(A) fuel model group composition",
+                    labels = c(
+                      "GR" = "grass (GR)",
+                      "GS" = "grass shrub (GS)",
+                      "SH" = "shrub (SH)",
+                      "TL" = "timber litter (TL)",
+                      "TU" = "timber understory (TU)",
+                      "SB" = "Slash & Blowdown (SB)"
+                    ))+
+  labs(x = "forest type", y = "percent of plots (%)")+
+  theme_bw()+
+  theme(#axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.x = element_blank())
+
+data(fuelModels, fuelMoisture)
+fuelModels_tbl <- rownames_to_column(fuelModels, var = "FM")
+
+Hypothetical_constants <- data.frame(CBH = seq(0, 12, by = 0.25),
+                    CBD = 0.1,
+                    CFL = 1.5,
+                    FMC = 90,
+                    slope = 9,
+                    direction = 0,
+                    windspeed = 250,
+                    waf = 0.2)
+
+crownFuel <- as.data.frame(Hypothetical_constants %>% select(CBD, FMC, CBH, CFL))
+enviro <- as.data.frame(Hypothetical_constants %>% select(slope, windspeed, direction, waf))
+
+fm_list <- c("GR2", "GS2", "SH2", "TL1", "TU1", "SB3")
+AllFM_list <- vector("list", length(fm_list))
+names(AllFM_list) <- fm_list
+
+moist <- fuelMoisture["D1L1", ]
+
+for (f in seq_along(fm_list)) {
+
+  fm <- fm_list[f]
+  surfFuel <- fuelModels[fm, , drop = FALSE]
+
+  FM_list <- vector("list", nrow(crownFuel))
+
+  for (i in seq_len(nrow(crownFuel))) {
+
+    out <- rothermel(
+      surfFuel  = surfFuel,
+      moist     = moist,
+      crownFuel = crownFuel[i, , drop = FALSE],
+      enviro    = enviro[i, , drop = FALSE]
+    )
+
+    FM_list[[i]] <- out$fireBehavior
+  }
+
+  FM_df <- do.call(rbind, FM_list) %>%
+    bind_cols(Hypothetical_constants) %>%
+    mutate(FuelModel = fm)
+
+  AllFM_list[[f]] <- FM_df
+}
+
+TI_df <- bind_rows(AllFM_list)
+
+TI_df$FuelModel <- factor(TI_df$FuelModel, levels = c("SB3", "TU1", "TL1", "SH2", "GS2", "GR2"))
+
+TI_df$TI_kmh <- TI_df$`Torching Index [m/min]` * 60/1000
+
+palette <- rev(c(
+  "GR2" = "chartreuse1", 
+  "GS2" = "olivedrab4",  
+  "SH2" = "darkgreen",  
+  "TL1" = "tan",  
+  "TU1" = "tan3", 
+  "SB3" = "brown4"   
+))
+
+TI_curves <- TI_df %>%
+  ggplot(aes(x = CBH, y = TI_kmh,
+             color = FuelModel)) +
+  geom_line(linewidth = 1.2) +
+  scale_y_log10()+
+  coord_cartesian(xlim = c(0,12.5))+
+  scale_color_manual(values = palette,
+                     name = "(B) dominant fuel model per group",
+                    labels = c(
+                      "GR2" = "low load grass (GR2)",
+                      "GS2" = "moderate load grass shrub (GS2)",
+                      "SH2" = "moderate load shrub (SH2)",
+                      "TL1" = "low load timber litter (TL1)",
+                      "TU1" = "low load timber understory (TU1)",
+                      "SB3" = "high load slash & blowdown (SB3)"))+
+ # ylim(c(0,150))+
+  labs(
+    x = "Canopy base height (m)",
+    y = "Torching index (km/hr)",
+    color = "Surface fuel model"
+  ) +
+  theme_bw()
+
+plot_grid(
+  SFM_breakdown,
+  TI_curves,
+  nrow = 1,
+  rel_widths = c(1, 1),
+  rel_heights = c(1, 1)
+)
+```
+

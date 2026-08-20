@@ -1,0 +1,226 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r Load Libraries}
+library(tidyverse)
+library(terra)
+library(tidyterra)
+
+options(scipen = 999)
+options(timeout = 10000)
+
+Plot_locations <- vect("Data/Plots/Campaign2023_Plots.shp")
+```
+
+
+```{r PrProducing CaBH Dataset}
+### Field CaBH ###
+Campaign23 <- read.csv("Data/Campaign2023.csv")%>%
+  group_by(Plot, Species, ForTyp) %>%
+  summarise(Circumference = rowMeans(
+      cbind(as.numeric(Circumference_cm),
+            as.numeric(Circumference_cm2),
+            as.numeric(Circumference_cm3),
+            as.numeric(Circumference_cm4)), na.rm = TRUE),
+    Tree_Height = rowMeans(
+      cbind(as.numeric(Tree_Height_1),
+            as.numeric(Tree_Height_2),
+            as.numeric(Tree_Height_3)), na.rm = TRUE),
+    CrBH = rowMeans(
+      cbind(as.numeric(CrBH_1),
+            as.numeric(CrBH_2),
+            as.numeric(CrBH_3)), na.rm = TRUE),.groups = "drop")
+
+Campaign23 <- Campaign23 %>%
+  filter(Plot != 4)%>% # remove plot without species informaiton 
+  filter(Plot != 17)%>% # remove single aspen dominated plot
+  filter(!Plot %in% c(21, 22, 28, 36, 38, 39, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 100, 102, 103, 104, 106)) # Remove plots disturbed by fire or management since 2017
+
+CaBH_Comparison <- Campaign23 %>%
+  group_by(Plot, ForTyp)%>%
+  summarise(Field_Mean = mean(CrBH, na.rm = TRUE),
+            Field_Med = median(CrBH, na.rm = TRUE),
+            Field_20th = quantile(CrBH, probs = 0.2, na.rm = TRUE),
+            Field_Min = min(CrBH, na.rm = TRUE))
+
+### FVS CaBH ###
+FVS_CBH <- read.csv("Data/FVS_CBH_Output.csv")%>%
+  filter(Year == '2023')%>%
+  select(StandID, Canopy_Ht) %>%
+  group_by(StandID)%>%
+  summarise(CBH = Canopy_Ht * 0.3048)%>% 
+  rename("Plot" = "StandID", "FVS_noCR" = "CBH")
+
+FVS_CBH_CR <- read.csv("Data/FVS_CBH_Output_CR.csv") %>%
+  filter(Year == '2023')%>%
+  select(StandID, Canopy_Ht) %>%
+  group_by(StandID)%>%
+  summarise(CBH = Canopy_Ht * 0.3048) %>% 
+  rename("Plot" = "StandID", "FVS_CR" = "CBH")
+
+CaBH_Comparison <- CaBH_Comparison %>%
+  left_join(FVS_CBH, by = "Plot") %>%
+  left_join(FVS_CBH_CR, by = "Plot")
+
+### LiDAR CaBH ###
+LiDAR_CrBH <- read.csv("Data/LiDAR_CrBH.csv")
+
+LiDAR_CaBH <- LiDAR_CrBH %>%
+  select(Plot, tree_cbh_m)%>%
+  group_by(Plot)%>%
+  summarize(LiDAR_Mean = mean(tree_cbh_m),
+            LiDAR_Med = median(tree_cbh_m),
+            LiDAR_20th = quantile(tree_cbh_m, probs = 0.2, na.rm = TRUE),
+            LiDAR_Min = min(tree_cbh_m))
+
+CaBH_Comparison <- CaBH_Comparison %>%
+  left_join(LiDAR_CaBH, by = "Plot") %>% 
+  na.omit()
+
+### LANDFIRE CaBH ###
+Plot_locations <- project(Plot_locations, "EPSG:5070")
+
+LANDFIRE_CaBH <- rast("D:/PhD/Research/GeoSpatialProducts/Data/RawData/CBH/LC23_CBH_240.tif") %>% # Path to LANDFIRE 2023 CaBH raster
+  extract(Plot_locations, fun = "mean", weight = TRUE, na.rm = TRUE) %>%
+  mutate(LANDFIRE = LC23_CBH_240 / 10, 
+         Plot = Plot_locations$Plot)%>%
+  select(Plot, LANDFIRE)
+
+CaBH_Comparison <- CaBH_Comparison %>% 
+  left_join(LANDFIRE_CaBH, by = c("Plot" = "Plot"))
+
+### Sentinel CaBH ###
+Plot_locations <- project(Plot_locations, "EPSG:4326")
+
+Sentinel_mean <- rast("Data/GEE_cbhlowestmean_2017.tif") %>%
+  extract(Plot_locations, fun = "mean", weight = TRUE, na.rm = TRUE)%>%
+  mutate(Plot = Plot_locations$Plot) %>%
+  select(Plot, classification) %>%
+  rename("Plot" = "Plot", "Sentinel_Mean" = "classification")
+
+Sentinel_median <- rast("Data/GEE_cbhlowestmedian_2017.tif") %>%
+  extract(Plot_locations, fun = "mean", weight = TRUE, na.rm = TRUE)%>%
+  mutate(Plot = Plot_locations$Plot) %>%
+  select(Plot, classification) %>%
+  rename("Plot" = "Plot", "Sentinel_Median" = "classification")
+
+Sentinel_20th <- rast("Data/GEE_cbhlowest20th_2017.tif") %>%
+  extract(Plot_locations, fun = "mean", weight = TRUE, na.rm = TRUE)%>%
+  mutate(Plot = Plot_locations$Plot) %>%
+  select(Plot, classification) %>%
+  rename("Plot" = "Plot", "Sentinel_20th" = "classification")
+
+Sentinel_min <- rast("Data/GEE_cbhlowestmin_2017.tif") %>%
+  extract(Plot_locations, fun = "mean", weight = TRUE, na.rm = TRUE)%>%
+  mutate(Plot = Plot_locations$Plot) %>%
+  select(Plot, classification) %>%
+  rename("Plot" = "Plot", "Sentinel_Min" = "classification")
+
+CaBH_Comparison <- CaBH_Comparison %>%
+  left_join(Sentinel_mean, by = "Plot") %>%
+  left_join(Sentinel_median, by = "Plot") %>%
+  left_join(Sentinel_20th, by = "Plot") %>%
+  left_join(Sentinel_min, by = "Plot")
+```
+
+
+```{r Summarizing Results}
+# Mean plot CaBH range across methods
+CaBH_Comparison %>%
+  rowwise() %>%
+  mutate(CaBH_min = min(c_across(Field_Mean: Sentinel_Min), na.rm = TRUE),
+         CaBH_max = max(c_across(Field_Mean: Sentinel_Min), na.rm = TRUE),
+         CaBH_range = CaBH_max - CaBH_min) %>%
+  ungroup()%>%
+  summarise(Mean_Range = mean(CaBH_range))
+
+# Pivot longer
+CaBH_Comparison_long <- CaBH_Comparison %>%
+  pivot_longer(cols = c(Field_Mean, Field_Med, Field_20th, Field_Min, FVS_noCR, FVS_CR,
+                        LiDAR_Mean, LiDAR_Med, LiDAR_20th, LiDAR_Min,
+                        Sentinel_Mean, Sentinel_Median, Sentinel_20th, Sentinel_Min, LANDFIRE),
+               names_to = "Method",
+               values_to = "CBH") %>%
+  mutate(Method = factor(Method,
+                         levels = c("Field_Mean", "Field_Med", "Field_20th", "Field_Min",
+                                    "LiDAR_Mean", "LiDAR_Med", "LiDAR_20th", "LiDAR_Min",
+                                    "Sentinel_Mean", "Sentinel_Median", "Sentinel_20th", "Sentinel_Min",
+                                    "FVS_noCR", "FVS_CR", "LANDFIRE")))%>%
+  mutate(ForTyp = factor(ForTyp,
+                         levels = c( "pinyon-juniper", "ponderosa pine", "mixed conifer", "spruce-fir"),
+                         labels = c("pinyon-juniper\n(n=22)", "ponderosa pine\n(n = 40)", "mixed conifer\n(n = 15)", "spruce-fir\n(n=16)")))
+
+# Summarize
+CaBH_summary <- CaBH_Comparison_long %>%
+  group_by(Method, ForTyp) %>%
+  summarise(mean_CBH = mean(CBH, na.rm = TRUE),
+            sd_CBH   = sd(CBH, na.rm = TRUE), .groups = "drop") %>%
+  mutate(label = paste0(round(mean_CBH, 1), " ± ", round(sd_CBH, 1)))
+```
+
+
+```{r Figure 4 - Boxplot}
+palette <- c(
+  "#08519c", "#3182bd",   "#6baed6", "#bdd7e7", 
+  "#a63603","#e6550d",  "#fd8d3c", "#fdbe85",  
+  "#54278f","#756bb1", "#9e9ac8", "#cbc9e2", 
+  "#78C042", "#D9EF9E", "#636363")
+
+outliers_df <- CaBH_Comparison_long %>%
+  group_by(ForTyp, Method) %>%
+  mutate(
+    q1  = quantile(CBH, 0.25, na.rm = TRUE),
+    q3  = quantile(CBH, 0.75, na.rm = TRUE),
+    iqr = q3 - q1,
+    lo  = q1 - 1.5 * iqr,
+    hi  = q3 + 1.5 * iqr,
+    is_outlier = CBH < lo | CBH > hi) %>%
+  ungroup() %>%
+  filter(is_outlier) %>%
+  select(ForTyp, Method, CBH)
+
+CaBH_Comparison_long %>%
+  ggplot(aes(x = Method, y = CBH, fill = Method)) +   
+  geom_boxplot(
+    color = "black",
+    linewidth = 0.25,
+    outlier.shape = NA) +
+  geom_point(
+    data = outliers_df,
+    aes(x = Method, y = CBH, fill = Method),
+    shape = 21,                                
+    color = "black",                          
+    position = position_dodge(width = 0.75),
+    size = 1.2,
+    stroke = 0.4) +
+  scale_fill_manual(values = palette, labels = c(
+    "Field_Mean" = "Field Mean CrBH",
+    "LiDAR_Mean" = "LiDAR Mean CrBH",
+    "Sentinel_Mean"   = "Sentinel Mean CrBH",
+    "Field_Med"  = "Field Median CrBH",
+    "LiDAR_Med"  = "LiDAR Median CrBH",
+    "Sentinel_Median"    = "Sentinel Median CrBH",
+    "Field_20th" = "Field 20th Percentile CrBH",
+    "LiDAR_20th" = "LiDAR 20th Percentile CrBH",
+    "Sentinel_20th"   = "Sentinel 20th Percentile CrBH",
+    "Field_Min"  = "Field Minimum CrBH",
+    "LiDAR_Min"  = "LiDAR Minimum CrBH",
+    "Sentinel_Min"    = "Sentinel Minimum CrBH",
+    "FVS_noCR"   = "FVS-FFE (no crown ratio)",
+    "FVS_CR"     = "FVS-FFE (with crown ratio)",
+    "LANDFIRE"   = "LANDFIRE")) +
+  scale_color_manual(values = palette, guide = "none") +
+  labs(x = "Method", y = "CBH (m)") +
+  theme_bw(base_size = 8) +
+  theme(
+    axis.text.x  = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.x = element_blank(),
+    panel.spacing = unit(0.8, "lines")) +
+  facet_wrap(~ ForTyp, scales = "free", ncol = 2)
+```
+
